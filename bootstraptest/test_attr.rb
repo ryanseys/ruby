@@ -50,3 +50,13 @@ assert_equal %{ok}, %{
 
   Big.new.foo
 }
+
+assert_equal %{ok}, %{
+  # More instance variables than the threshold of the shape redblack cache
+  obj = Object.new
+  40.times do |i|
+    obj.instance_variable_set(:"@ivar_\#{i}", i)
+  end
+
+  40.times.all? { |i| obj.instance_variable_get(:"@ivar_\#{i}") == i } ? :ok : :ng
+}
