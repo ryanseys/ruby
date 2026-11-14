@@ -264,7 +264,10 @@ redblack_insert_aux(redblack_node_t *tree, ID key, rb_shape_t *value)
         redblack_node_t *left, *right;
         if (key < tree->key) {
             left = redblack_insert_aux(redblack_left(tree), key, value);
-            RUBY_ASSERT(left != LEAF);
+            if (left == LEAF) {
+                // We're out of cache, the shape gets no index
+                return LEAF;
+            }
             right = redblack_right(tree);
             RUBY_ASSERT(right == LEAF || right->key > tree->key);
         }
@@ -272,7 +275,10 @@ redblack_insert_aux(redblack_node_t *tree, ID key, rb_shape_t *value)
             left = redblack_left(tree);
             RUBY_ASSERT(left == LEAF || left->key < tree->key);
             right = redblack_insert_aux(redblack_right(tree), key, value);
-            RUBY_ASSERT(right != LEAF);
+            if (right == LEAF) {
+                // We're out of cache, the shape gets no index
+                return LEAF;
+            }
         }
         else {
             return tree;
@@ -1530,6 +1536,23 @@ rb_shape_exhaust(int argc, VALUE *argv, VALUE self)
     return Qnil;
 }
 
+// Leave room for only `remaining` more nodes in the redblack cache.
+static VALUE
+rb_shape_exhaust_redblack_cache(int argc, VALUE *argv, VALUE self)
+{
+    rb_check_arity(argc, 0, 1);
+    unsigned int remaining = argc == 1 ? NUM2UINT(argv[0]) : 0;
+
+    // redblack_new fails when redblack_cache_size + 1 >= REDBLACK_CACHE_SIZE.
+    if (redblack_cache && remaining < REDBLACK_CACHE_SIZE - 1) {
+        rb_atomic_t size = REDBLACK_CACHE_SIZE - 1 - remaining;
+        if (size > redblack_cache_size) {
+            RUBY_ATOMIC_SET(redblack_cache_size, size);
+        }
+    }
+    return Qnil;
+}
+
 static VALUE
 rb_shape_class_max_iv_count(VALUE self, VALUE klass)
 {
@@ -1711,6 +1734,7 @@ Init_shape(void)
     rb_define_singleton_method(rb_cShape, "root_shape", rb_shape_root_shape, 0);
     rb_define_singleton_method(rb_cShape, "shapes_available", rb_shape_shapes_available, 0);
     rb_define_singleton_method(rb_cShape, "exhaust_shapes", rb_shape_exhaust, -1);
+    rb_define_singleton_method(rb_cShape, "exhaust_redblack_cache", rb_shape_exhaust_redblack_cache, -1);
     rb_define_singleton_method(rb_cShape, "class_max_iv_count", rb_shape_class_max_iv_count, 1);
 #endif
 }
