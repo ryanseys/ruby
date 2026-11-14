@@ -22,20 +22,6 @@
 
 #define REDBLACK_CACHE_SIZE (SHAPE_BUFFER_SIZE * 32)
 
-/* The redblack cache is a large array of nodes. A real mmap commits a page
- * only when the program touches it, so Init_default_shapes can reserve the
- * full array at boot. That does not work where mmap is absent, and it does
- * not work on WebAssembly, where the libc emulation of mmap allocates the
- * whole range and fills it with zeros. On those platforms the cache gets
- * its memory in chunks, each one when the first node in it is necessary. */
-#ifndef SHAPE_USE_MMAP
-# if defined(HAVE_MMAP) && !defined(__wasm__)
-#  define SHAPE_USE_MMAP 1
-# else
-#  define SHAPE_USE_MMAP 0
-# endif
-#endif
-
 #if !SHAPE_USE_MMAP
 # ifndef REDBLACK_CHUNK_BITS
 #  define REDBLACK_CHUNK_BITS 12
@@ -400,19 +386,31 @@ static RUBY_ALIGNAS(128) rb_atomic_t shape_next_id;
 static rb_shape_t *
 rb_shape_get_root_shape(void)
 {
-    return rb_shape_tree.shape_list;
+    return RSHAPE(ROOT_SHAPE_ID);
+}
+
+// The shape at `offset`, or NULL when its chunk does not exist.
+// RubyVM::Shape.exhaust_shapes leaves such gaps.
+static inline rb_shape_t *
+shape_at(shape_id_t offset)
+{
+#if SHAPE_USE_MMAP
+    return &rb_shape_tree.shape_list[offset];
+#else
+    rb_shape_t *chunk = RUBY_ATOMIC_PTR_LOAD(rb_shape_tree.shape_chunks[offset >> SHAPE_CHUNK_BITS]);
+    return chunk ? &chunk[offset & SHAPE_CHUNK_MASK] : NULL;
+#endif
 }
 
 static void
 shape_tree_mark_and_move(void *data)
 {
-    rb_shape_t *cursor = rb_shape_get_root_shape();
-    rb_shape_t *end = RSHAPE(shape_next_id - 1);
-    while (cursor <= end) {
-        if (cursor->edges && !SINGLE_CHILD_P(cursor->edges)) {
-            rb_gc_mark_and_move(&cursor->edges);
+    shape_id_t end = (shape_id_t)RUBY_ATOMIC_LOAD(shape_next_id);
+    for (shape_id_t offset = 0; offset < end; offset++) {
+        rb_shape_t *shape = shape_at(offset);
+        if (shape && shape->edges && !SINGLE_CHILD_P(shape->edges)) {
+            rb_gc_mark_and_move(&shape->edges);
         }
-        cursor++;
     }
 }
 
@@ -454,26 +452,28 @@ static inline shape_id_t
 SHAPE_OFFSET(rb_shape_t *shape)
 {
     RUBY_ASSERT(shape);
+#if SHAPE_USE_MMAP
     return (shape_id_t)(shape - rb_shape_tree.shape_list);
+#else
+    return shape->offset;
+#endif
 }
 
 static inline shape_id_t
 SHAPE_ID(rb_shape_t *shape, shape_id_t previous_shape_id)
 {
     RUBY_ASSERT(shape);
-    shape_id_t offset = (shape_id_t)(shape - rb_shape_tree.shape_list);
-    return offset | RSHAPE_FLAGS(previous_shape_id);
+    return SHAPE_OFFSET(shape) | RSHAPE_FLAGS(previous_shape_id);
 }
 
 void
 rb_shape_each_shape_id(each_shape_callback callback, void *data)
 {
-    rb_shape_t *start = rb_shape_get_root_shape();
-    rb_shape_t *cursor = start;
-    rb_shape_t *end = RSHAPE(RUBY_ATOMIC_LOAD(shape_next_id));
-    while (cursor < end) {
-        callback((shape_id_t)(cursor - start), data);
-        cursor += 1;
+    shape_id_t end = (shape_id_t)RUBY_ATOMIC_LOAD(shape_next_id);
+    for (shape_id_t offset = 0; offset < end; offset++) {
+        if (shape_at(offset)) {
+            callback(offset, data);
+        }
     }
 }
 
@@ -513,6 +513,26 @@ rb_shape_depth(shape_id_t shape_id)
     return depth;
 }
 
+#if !SHAPE_USE_MMAP
+// Make sure that the chunk for `offset` exists. This can run with no VM lock,
+// so the chunk table installs a chunk with a compare-and-swap.
+static bool
+shape_chunk_ensure(shape_id_t offset)
+{
+    rb_shape_t **slot = &rb_shape_tree.shape_chunks[offset >> SHAPE_CHUNK_BITS];
+
+    if (!RUBY_ATOMIC_PTR_LOAD(*slot)) {
+        rb_shape_t *chunk = calloc(SHAPE_CHUNK_SIZE, sizeof(rb_shape_t));
+        if (!chunk) return false;
+
+        if (RUBY_ATOMIC_PTR_CAS(*slot, NULL, chunk) != NULL) {
+            free(chunk); // another thread installed it first
+        }
+    }
+    return true;
+}
+#endif
+
 static rb_shape_t *
 shape_alloc(void)
 {
@@ -523,10 +543,19 @@ shape_alloc(void)
         if (current > MAX_SHAPE_ID) {
             return NULL;  // Out of shapes
         }
+#if !SHAPE_USE_MMAP
+        if (!shape_chunk_ensure(current)) {
+            return NULL;  // Out of memory, the same result as out of shapes
+        }
+#endif
         new_id = current + 1;
     } while (current != RUBY_ATOMIC_CAS(shape_next_id, current, new_id));
 
-    return &rb_shape_tree.shape_list[current];
+    rb_shape_t *shape = shape_at(current);
+#if !SHAPE_USE_MMAP
+    shape->offset = current;
+#endif
+    return shape;
 }
 
 static rb_shape_t *
@@ -735,6 +764,7 @@ get_next_shape_internal(rb_shape_t *shape, ID id, enum shape_type shape_type, bo
         }
         else {
             rb_shape_t *new_shape = rb_shape_alloc_new_child(id, shape, shape_type);
+            if (!new_shape) return NULL;
 
             if (!edges_table) {
                 // If the shape had no edge yet, we can directly set the new child
@@ -1676,7 +1706,7 @@ static VALUE
 rb_shape_find_by_id(VALUE mod, VALUE id)
 {
     shape_id_t shape_id = NUM2UINT(id);
-    if (shape_id >= rb_shapes_count()) {
+    if (shape_id >= rb_shapes_count() || !shape_at(shape_id)) {
         rb_raise(rb_eArgError, "Shape ID %d is out of bounds\n", shape_id);
     }
     return shape_id_t_to_rb_cShape(shape_id);
@@ -1694,7 +1724,7 @@ Init_default_shapes(void)
     if (max_capacity > SHAPE_ID_CAPACITY_MAX) max_capacity = SHAPE_ID_CAPACITY_MAX;
     rb_shape_tree.max_capacity = max_capacity;
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
     size_t shape_list_mmap_size = rb_size_mul_or_raise(SHAPE_BUFFER_SIZE, sizeof(rb_shape_t), rb_eRuntimeError);
     rb_shape_tree.shape_list = (rb_shape_t *)mmap(NULL, shape_list_mmap_size,
                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1704,13 +1734,11 @@ Init_default_shapes(void)
     else {
         ruby_annotate_mmap(rb_shape_tree.shape_list, shape_list_mmap_size, "Ruby:Init_default_shapes:shape_list");
     }
-#else
-    rb_shape_tree.shape_list = xcalloc(SHAPE_BUFFER_SIZE, sizeof(rb_shape_t));
-#endif
 
     if (!rb_shape_tree.shape_list) {
         rb_memerror();
     }
+#endif
 
     rb_shape_tree.id_object_id = rb_make_internal_id();
 
@@ -1739,6 +1767,9 @@ Init_default_shapes(void)
 
     // Root shape
     rb_shape_t *root = rb_shape_alloc_with_parent_offset(0, INVALID_SHAPE_ID);
+    if (!root) {
+        rb_memerror();
+    }
     root->capacity = 0;
     root->type = SHAPE_ROOT;
     RUBY_ASSERT(SHAPE_OFFSET(root) == ROOT_SHAPE_ID);
