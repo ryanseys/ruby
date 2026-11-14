@@ -22,6 +22,29 @@
 
 #define REDBLACK_CACHE_SIZE (SHAPE_BUFFER_SIZE * 32)
 
+/* The redblack cache is a large array of nodes. A real mmap commits a page
+ * only when the program touches it, so Init_default_shapes can reserve the
+ * full array at boot. That does not work where mmap is absent, and it does
+ * not work on WebAssembly, where the libc emulation of mmap allocates the
+ * whole range and fills it with zeros. On those platforms the cache gets
+ * its memory in chunks, each one when the first node in it is necessary. */
+#ifndef SHAPE_USE_MMAP
+# if defined(HAVE_MMAP) && !defined(__wasm__)
+#  define SHAPE_USE_MMAP 1
+# else
+#  define SHAPE_USE_MMAP 0
+# endif
+#endif
+
+#if !SHAPE_USE_MMAP
+# ifndef REDBLACK_CHUNK_BITS
+#  define REDBLACK_CHUNK_BITS 12
+# endif
+# define REDBLACK_CHUNK_SIZE (1u << REDBLACK_CHUNK_BITS)
+# define REDBLACK_CHUNK_MASK (REDBLACK_CHUNK_SIZE - 1)
+# define REDBLACK_CHUNK_COUNT (REDBLACK_CACHE_SIZE >> REDBLACK_CHUNK_BITS)
+#endif
+
 /* This depends on that the allocated memory by Ruby's allocator or
  * mmap is not located at an odd address. */
 #define SINGLE_CHILD_TAG 0x1
@@ -44,7 +67,18 @@ struct redblack_node {
 };
 typedef struct redblack_node redblack_node_t;
 
+#if SHAPE_USE_MMAP
 static redblack_node_t *redblack_cache;
+#else
+// A chunk does not move after its allocation, so readers need no lock.
+static redblack_node_t *redblack_chunks[REDBLACK_CHUNK_COUNT];
+#endif
+
+// True when the cache cannot get more memory. It stays true: after a failed
+// insert a shape has no index, and an index for one of its descendants
+// would not hold the ancestors. A lookup trusts a miss in an index, so such
+// an index would give wrong results.
+static rb_atomic_t redblack_cache_exhausted;
 
 #define LEAF 0
 #define BLACK 0x0
@@ -53,7 +87,13 @@ static redblack_node_t *redblack_cache;
 static inline redblack_node_t *
 redblack_node(redblack_id_t id)
 {
+#if SHAPE_USE_MMAP
     return id ? &redblack_cache[id - 1] : LEAF;
+#else
+    if (!id) return LEAF;
+    redblack_node_t *chunk = RUBY_ATOMIC_PTR_LOAD(redblack_chunks[(id - 1) >> REDBLACK_CHUNK_BITS]);
+    return &chunk[(id - 1) & REDBLACK_CHUNK_MASK];
+#endif
 }
 
 static redblack_node_t *
@@ -120,7 +160,6 @@ redblack_value(redblack_node_t *node)
     return (rb_shape_t *)((uintptr_t)node->value & ~(uintptr_t)1);
 }
 
-#ifdef HAVE_MMAP
 static inline char
 redblack_color(redblack_node_t *node)
 {
@@ -141,25 +180,63 @@ redblack_id_for(redblack_node_t *node)
         return 0;
     }
     else {
+#if SHAPE_USE_MMAP
         redblack_node_t *redblack_nodes = redblack_cache;
         redblack_id_t id = (redblack_id_t)(node - redblack_nodes);
         return id + 1;
+#else
+        // Search from the newest chunk, because an insert links mostly new nodes.
+        uintptr_t addr = (uintptr_t)node;
+        for (redblack_id_t index = redblack_cache_size >> REDBLACK_CHUNK_BITS; ; index--) {
+            uintptr_t base = (uintptr_t)redblack_chunks[index];
+            if (base && addr >= base && addr - base < REDBLACK_CHUNK_SIZE * sizeof(redblack_node_t)) {
+                redblack_id_t offset = (redblack_id_t)((addr - base) / sizeof(redblack_node_t));
+                return (index << REDBLACK_CHUNK_BITS) + offset + 1;
+            }
+            if (index == 0) rb_bug("redblack_id_for: the node is not in the redblack cache");
+        }
+#endif
     }
 }
+
+#if !SHAPE_USE_MMAP
+// The caller holds the VM lock.
+static bool
+redblack_chunk_ensure(redblack_id_t index)
+{
+    if (!redblack_chunks[index]) {
+        redblack_node_t *chunk = calloc(REDBLACK_CHUNK_SIZE, sizeof(redblack_node_t));
+        if (!chunk) return false;
+        RUBY_ATOMIC_PTR_SET(redblack_chunks[index], chunk);
+    }
+    return true;
+}
+#endif
 
 static redblack_node_t *
 redblack_new(char color, ID key, rb_shape_t *value, redblack_node_t *left, redblack_node_t *right)
 {
-    if (redblack_cache_size + 1 >= REDBLACK_CACHE_SIZE) {
-        // We're out of cache, just quit
+    if (RUBY_ATOMIC_LOAD(redblack_cache_exhausted)) {
         return LEAF;
     }
+
+    if (redblack_cache_size + 1 >= REDBLACK_CACHE_SIZE) {
+        // We're out of cache, just quit
+        RUBY_ATOMIC_SET(redblack_cache_exhausted, 1);
+        return LEAF;
+    }
+
+#if !SHAPE_USE_MMAP
+    if (!redblack_chunk_ensure(redblack_cache_size >> REDBLACK_CHUNK_BITS)) {
+        RUBY_ATOMIC_SET(redblack_cache_exhausted, 1);
+        return LEAF;
+    }
+#endif
 
     RUBY_ASSERT(left == LEAF || left->key < key);
     RUBY_ASSERT(right == LEAF || right->key > key);
 
-    redblack_node_t *redblack_nodes = redblack_cache;
-    redblack_node_t *node = &redblack_nodes[RUBY_ATOMIC_FETCH_ADD(redblack_cache_size, 1)];
+    redblack_node_t *node = redblack_node(RUBY_ATOMIC_FETCH_ADD(redblack_cache_size, 1) + 1);
     node->key = key;
     node->value = (rb_shape_t *)((uintptr_t)value | color);
     node->l = redblack_id_for(left);
@@ -313,7 +390,6 @@ redblack_insert(redblack_node_t *tree, ID key, rb_shape_t *value)
         return redblack_id_for(root);
     }
 }
-#endif
 
 static VALUE shape_tree_obj = Qfalse;
 rb_shape_tree_t rb_shape_tree = { 0 };
@@ -343,7 +419,7 @@ shape_tree_mark_and_move(void *data)
 size_t
 rb_shapes_cache_size(void)
 {
-    return redblack_cache ? redblack_cache_size : 0;
+    return redblack_cache_size;
 }
 
 size_t
@@ -355,10 +431,7 @@ rb_shapes_count(void)
 static size_t
 shape_tree_memsize(const void *data)
 {
-    if (redblack_cache) {
-        return redblack_cache_size * sizeof(redblack_node_t);
-    }
-    return 0;
+    return redblack_cache_size * sizeof(redblack_node_t);
 }
 
 static const rb_data_type_t shape_tree_type = {
@@ -482,7 +555,6 @@ rb_shape_alloc(ID edge_name, rb_shape_t *parent, enum shape_type type)
     return shape;
 }
 
-#ifdef HAVE_MMAP
 static redblack_node_t *
 redblack_cache_ancestors(rb_shape_t *shape)
 {
@@ -507,13 +579,6 @@ redblack_cache_ancestors(rb_shape_t *shape)
 
     return redblack_node(shape->ancestor_index);
 }
-#else
-static redblack_node_t *
-redblack_cache_ancestors(rb_shape_t *shape)
-{
-    return LEAF;
-}
-#endif
 
 static attr_index_t
 shape_grow_capa(attr_index_t current_capa)
@@ -544,7 +609,7 @@ rb_shape_alloc_new_child(ID id, rb_shape_t *shape, enum shape_type shape_type)
 
         RUBY_ASSERT(new_shape->capacity > shape->next_field_index);
         new_shape->next_field_index = shape->next_field_index + 1;
-        if (new_shape->next_field_index > ANCESTOR_CACHE_THRESHOLD) {
+        if (new_shape->next_field_index > ANCESTOR_CACHE_THRESHOLD && !RUBY_ATOMIC_LOAD(redblack_cache_exhausted)) {
             RB_VM_LOCKING() {
                 redblack_cache_ancestors(new_shape);
             }
@@ -1544,7 +1609,7 @@ rb_shape_exhaust_redblack_cache(int argc, VALUE *argv, VALUE self)
     unsigned int remaining = argc == 1 ? NUM2UINT(argv[0]) : 0;
 
     // redblack_new fails when redblack_cache_size + 1 >= REDBLACK_CACHE_SIZE.
-    if (redblack_cache && remaining < REDBLACK_CACHE_SIZE - 1) {
+    if (!RUBY_ATOMIC_LOAD(redblack_cache_exhausted) && remaining < REDBLACK_CACHE_SIZE - 1) {
         rb_atomic_t size = REDBLACK_CACHE_SIZE - 1 - remaining;
         if (size > redblack_cache_size) {
             RUBY_ATOMIC_SET(redblack_cache_size, size);
@@ -1649,18 +1714,16 @@ Init_default_shapes(void)
 
     rb_shape_tree.id_object_id = rb_make_internal_id();
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
     size_t shape_cache_mmap_size = rb_size_mul_or_raise(REDBLACK_CACHE_SIZE, sizeof(redblack_node_t), rb_eRuntimeError);
     redblack_cache = (redblack_node_t *)mmap(NULL, shape_cache_mmap_size,
                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     redblack_cache_size = 0;
 
     // If mmap fails, then give up on the redblack tree cache.
-    // We set the cache size such that the redblack node allocators think
-    // the cache is full.
     if (redblack_cache == MAP_FAILED) {
         redblack_cache = NULL;
-        redblack_cache_size = REDBLACK_CACHE_SIZE;
+        RUBY_ATOMIC_SET(redblack_cache_exhausted, 1);
     }
     else {
         ruby_annotate_mmap(redblack_cache, shape_cache_mmap_size, "Ruby:Init_default_shapes:shape_cache");
