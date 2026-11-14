@@ -14,6 +14,29 @@ STATIC_ASSERT(shape_id_num_bits, SHAPE_ID_NUM_BITS == sizeof(shape_id_t) * CHAR_
 #define SHAPE_BUFFER_SIZE (1 << SHAPE_ID_OFFSET_NUM_BITS)
 #define SHAPE_ID_OFFSET_MASK (SHAPE_BUFFER_SIZE - 1)
 
+/* The shape list and the redblack cache are large arrays. A real mmap commits
+ * a page only when the program touches it, so Init_default_shapes can reserve
+ * the full arrays at boot. That does not work where mmap is absent, and it
+ * does not work on WebAssembly, where the libc emulation of mmap allocates
+ * the whole range and fills it with zeros. On those platforms each array gets
+ * its memory in chunks, each one when the first entry in it is necessary. */
+#ifndef SHAPE_USE_MMAP
+# if defined(HAVE_MMAP) && !defined(__wasm__)
+#  define SHAPE_USE_MMAP 1
+# else
+#  define SHAPE_USE_MMAP 0
+# endif
+#endif
+
+#if !SHAPE_USE_MMAP
+# ifndef SHAPE_CHUNK_BITS
+#  define SHAPE_CHUNK_BITS 12
+# endif
+# define SHAPE_CHUNK_SIZE (1u << SHAPE_CHUNK_BITS)
+# define SHAPE_CHUNK_MASK (SHAPE_CHUNK_SIZE - 1)
+# define SHAPE_CHUNK_COUNT (SHAPE_BUFFER_SIZE >> SHAPE_CHUNK_BITS)
+#endif
+
 #define SHAPE_ID_CAPACITY_BITS 7
 #define SHAPE_ID_CAPACITY_MAX ((1U << SHAPE_ID_CAPACITY_BITS) - 1)
 
@@ -117,6 +140,9 @@ struct rb_shape {
     ID edge_name; // ID (ivar) for transition from parent to rb_shape
     redblack_id_t ancestor_index;
     shape_id_t parent_offset;
+#if !SHAPE_USE_MMAP
+    shape_id_t offset; // The index of this shape in the shape list
+#endif
     attr_index_t next_field_index; // Fields are either ivars or internal properties like `object_id`
     attr_index_t capacity; // Total capacity of the object with this shape
     enum shape_type type : 8;
@@ -133,7 +159,12 @@ enum shape_flags {
 };
 
 typedef struct {
+#if SHAPE_USE_MMAP
     rb_shape_t *shape_list;
+#else
+    // A chunk does not move after its allocation, so readers need no lock.
+    rb_shape_t *shape_chunks[SHAPE_CHUNK_COUNT];
+#endif
     attr_index_t max_capacity;
     ID id_object_id;
 } rb_shape_tree_t;
@@ -275,7 +306,12 @@ RSHAPE(shape_id_t shape_id)
 {
     shape_id_t offset = RSHAPE_OFFSET(shape_id);
     RUBY_ASSERT(offset != INVALID_SHAPE_ID);
+#if SHAPE_USE_MMAP
     return &rb_shape_tree.shape_list[offset];
+#else
+    rb_shape_t *chunk = RUBY_ATOMIC_PTR_LOAD(rb_shape_tree.shape_chunks[offset >> SHAPE_CHUNK_BITS]);
+    return &chunk[offset & SHAPE_CHUNK_MASK];
+#endif
 }
 
 int32_t rb_shape_id_offset(void);
