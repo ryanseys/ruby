@@ -16,6 +16,19 @@
 #include <sys/mman.h>
 #endif
 
+/* Init_default_shapes reserves the shape list and the ancestor cache with
+ * mmap at their full size. A real mmap commits a page only when the program
+ * touches it, so the reservation is cheap. WebAssembly has no real mmap:
+ * the wasi-libc and Emscripten emulations allocate the whole range and fill
+ * it with zeros. On wasm, use the path for platforms without mmap. That
+ * path does not build the ancestor cache, which is the larger buffer. It
+ * still allocates the full shape list. */
+#if defined(HAVE_MMAP) && !defined(__wasm__)
+# define SHAPE_USE_MMAP 1
+#else
+# define SHAPE_USE_MMAP 0
+#endif
+
 #ifndef SHAPE_DEBUG
 #define SHAPE_DEBUG (VM_CHECK_MODE > 0)
 #endif
@@ -120,7 +133,7 @@ redblack_value(redblack_node_t *node)
     return (rb_shape_t *)((uintptr_t)node->value & ~(uintptr_t)1);
 }
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
 static inline char
 redblack_color(redblack_node_t *node)
 {
@@ -476,7 +489,7 @@ rb_shape_alloc(ID edge_name, rb_shape_t *parent, enum shape_type type)
     return shape;
 }
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
 static redblack_node_t *
 redblack_cache_ancestors(rb_shape_t *shape)
 {
@@ -1606,7 +1619,7 @@ Init_default_shapes(void)
     if (max_capacity > SHAPE_ID_CAPACITY_MAX) max_capacity = SHAPE_ID_CAPACITY_MAX;
     rb_shape_tree.max_capacity = max_capacity;
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
     size_t shape_list_mmap_size = rb_size_mul_or_raise(SHAPE_BUFFER_SIZE, sizeof(rb_shape_t), rb_eRuntimeError);
     rb_shape_tree.shape_list = (rb_shape_t *)mmap(NULL, shape_list_mmap_size,
                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
@@ -1626,7 +1639,7 @@ Init_default_shapes(void)
 
     rb_shape_tree.id_object_id = rb_make_internal_id();
 
-#ifdef HAVE_MMAP
+#if SHAPE_USE_MMAP
     size_t shape_cache_mmap_size = rb_size_mul_or_raise(REDBLACK_CACHE_SIZE, sizeof(redblack_node_t), rb_eRuntimeError);
     redblack_cache = (redblack_node_t *)mmap(NULL, shape_cache_mmap_size,
                          PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
