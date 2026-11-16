@@ -189,6 +189,61 @@ class TestShapes < Test::Unit::TestCase
     end;
   end
 
+  def test_redblack_cache_full_insert_on_right
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      obj = Class.new.new
+      # More than ANCESTOR_CACHE_THRESHOLD ivars, so the shape has an index.
+      20.times { |i| obj.instance_variable_set(:"@a#{i}", i) }
+
+      RubyVM::Shape.exhaust_redblack_cache
+
+      # Each new ivar id is larger than all ids in the index.
+      20.upto(39) { |i| obj.instance_variable_set(:"@a#{i}", i) }
+
+      40.times { |i| assert_equal i, obj.instance_variable_get(:"@a#{i}") }
+      assert_equal 40, obj.instance_variables.size
+    end;
+  end
+
+  def test_redblack_cache_full_insert_on_left
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      # An ivar gets its id when a program sets it for the first time.
+      # This object fixes the order of the ids.
+      names = 40.times.map { |i| :"@a#{i}" }
+      first = Class.new.new
+      names.each { |name| first.instance_variable_set(name, 0) }
+
+      obj = Class.new.new
+      20.upto(39) { |i| obj.instance_variable_set(names[i], i) }
+
+      RubyVM::Shape.exhaust_redblack_cache
+
+      # Each of these ivar ids is smaller than all ids in the index.
+      19.downto(0) { |i| obj.instance_variable_set(names[i], i) }
+
+      40.times { |i| assert_equal i, obj.instance_variable_get(names[i]) }
+      assert_equal 40, obj.instance_variables.size
+    end;
+  end
+
+  def test_redblack_cache_fills_during_insert
+    assert_separately([], "#{<<~"begin;"}\n#{<<~'end;'}")
+    begin;
+      obj = Class.new.new
+      20.times { |i| obj.instance_variable_set(:"@a#{i}", i) }
+
+      # Room for two nodes: the next insert starts and then fails.
+      RubyVM::Shape.exhaust_redblack_cache(2)
+
+      20.upto(39) { |i| obj.instance_variable_set(:"@a#{i}", i) }
+
+      40.times { |i| assert_equal i, obj.instance_variable_get(:"@a#{i}") }
+      assert_equal 40, obj.instance_variables.size
+    end;
+  end
+
   def test_too_many_ivs_on_class
     obj = Class.new
 
